@@ -1,0 +1,176 @@
+import numpy as np
+import pandas as pd
+from gurobipy import Model, GRB, quicksum
+import random
+
+# Read the input data
+costs_df = pd.read_csv('costs.csv')
+randomness_df = pd.read_csv('randomness.csv')
+
+# Extract data from the dataframes
+travel_costs = costs_df.iloc[:, 1:].values  # Skip the first column (names)
+probabilities = randomness_df['Probability'].values
+mean_demands = randomness_df['Mean_Demand'].values
+std_devs = randomness_df['Std_Dev_Demand'].values
+
+# Constants
+num_stations = len(probabilities)  # Number of gas stations (excluding depot)
+num_nodes = num_stations + 1      # Include depot (node 0)
+too_big_cost = 0.09               # Cost per liter of excess capacity
+too_small_cost = 0.13             # Cost per liter of unmet demand
+num_trials = 20                   # Number of Monte Carlo trials
+num_scenarios = 10                # Number of scenarios per trial
+
+# Function to generate random scenarios
+def generate_scenarios(num_scenarios):
+    scenarios = []
+    
+    for _ in range(num_scenarios):
+        # Determine which stations need refueling
+        needs_refueling = [random.random() < prob for prob in probabilities]
+        
+        # Generate demand for stations that need refueling
+        demands = np.zeros(num_stations)
+        for i in range(num_stations):
+            if needs_refueling[i]:
+                # Generate normally distributed demand
+                demand = np.random.normal(mean_demands[i], std_devs[i])
+                demands[i] = max(0, demand)  # No negative demands
+        
+        scenarios.append((needs_refueling, demands))
+    
+    return scenarios
+
+# Function to solve the second-stage problem (routing and delivery)
+def solve_second_stage(truck_size, needs_refueling, demands):
+    model = Model("FuelFlow_SecondStage")
+    model.setParam('OutputFlag', 0)  # Suppress output
+    
+    # Decision variables
+    # x[i,j] = 1 if travel from node i to node j
+    x = {}
+    for i in range(num_nodes):
+        for j in range(num_nodes):
+            if i != j:
+                x[i,j] = model.addVar(vtype=GRB.BINARY, name=f"x_{i}_{j}")
+    
+    # Create variables only for nodes that need service
+    active_nodes = [0]  # Always include depot
+    for i in range(num_stations):
+        if needs_refueling[i]:
+            active_nodes.append(i+1)
+    
+    # Objective: minimize travel cost
+    model.setObjective(
+        quicksum(travel_costs[i,j] * x[i,j] for i in active_nodes for j in active_nodes if i != j),
+        GRB.MINIMIZE
+    )
+    
+    # Constraints
+    # Each node that needs refueling must be visited exactly once
+    for i in active_nodes:
+        if i > 0:  # Skip depot
+            model.addConstr(
+                quicksum(x[j,i] for j in active_nodes if j != i) == 1
+            )
+            model.addConstr(
+                quicksum(x[i,j] for j in active_nodes if j != i) == 1
+            )
+    
+    # Depot flow constraints
+    model.addConstr(
+        quicksum(x[0,j] for j in active_nodes if j != 0) == 1
+    )
+    model.addConstr(
+        quicksum(x[i,0] for i in active_nodes if i != 0) == 1
+    )
+    
+    # Subtour elimination constraints
+    if len(active_nodes) > 2:  # Only needed if more than depot + 1 node
+        # Add SEC using MTZ formulation
+        u = {}
+        for i in active_nodes:
+            if i > 0:  # Skip depot
+                u[i] = model.addVar(lb=0, ub=len(active_nodes)-1, vtype=GRB.INTEGER, name=f"u_{i}")
+        
+        # MTZ subtour elimination
+        for i in active_nodes:
+            if i > 0:  # Skip depot
+                for j in active_nodes:
+                    if j > 0 and i != j:  # Skip depot and same node
+                        model.addConstr(
+                            u[i] - u[j] + len(active_nodes)*x[i,j] <= len(active_nodes)-1
+                        )
+    
+    # Solve the model
+    model.optimize()
+    
+    if model.status == GRB.OPTIMAL:
+        # Calculate total demand for stations in the route
+        total_demand = sum(demands[i-1] for i in active_nodes if i > 0)
+        
+        # Calculate truck size mismatch costs
+        if total_demand > truck_size:
+            mismatch_cost = too_small_cost * (total_demand - truck_size)
+        else:
+            mismatch_cost = too_big_cost * (truck_size - total_demand)
+        
+        # Total cost = travel cost + mismatch cost
+        total_cost = model.objVal + mismatch_cost
+        return total_cost
+    else:
+        # If no feasible solution (e.g., no nodes need service)
+        return too_big_cost * truck_size  # Only cost is having too big a truck
+        
+# Function to perform Sample Average Approximation (SAA)
+def perform_saa():
+    # Range of truck sizes to evaluate
+    min_size = min(mean_demands) * 0.5
+    max_size = sum(mean_demands) * 1.2
+    
+    # Try different truck sizes
+    step_size = (max_size - min_size) / 30
+    best_truck_size = None
+    best_expected_cost = float('inf')
+    
+    # Results storage
+    all_truck_sizes = []
+    all_expected_costs = []
+    
+    for truck_size in np.arange(min_size, max_size, step_size):
+        trial_costs = []
+        
+        for _ in range(num_trials):
+            # Generate scenarios for this trial
+            scenarios = generate_scenarios(num_scenarios)
+            
+            # Solve second-stage problem for each scenario
+            scenario_costs = []
+            for needs_refueling, demands in scenarios:
+                cost = solve_second_stage(truck_size, needs_refueling, demands)
+                scenario_costs.append(cost)
+            
+            # Calculate average cost for this trial
+            avg_cost = sum(scenario_costs) / len(scenario_costs)
+            trial_costs.append(avg_cost)
+        
+        # Calculate expected cost across all trials
+        expected_cost = sum(trial_costs) / len(trial_costs)
+        all_truck_sizes.append(truck_size)
+        all_expected_costs.append(expected_cost)
+        
+        # Update best solution
+        if expected_cost < best_expected_cost:
+            best_expected_cost = expected_cost
+            best_truck_size = truck_size
+    
+    return best_truck_size, best_expected_cost, all_truck_sizes, all_expected_costs
+
+# Run the SAA algorithm
+best_truck_size, best_expected_cost, all_sizes, all_costs = perform_saa()
+
+print(f"Optimal truck size: {best_truck_size:.2f} liters")
+print(f"Optimal expected cost: {best_expected_cost:.2f}")
+
+# This simulates 20 trials with 10 scenarios per trial
+# The final result is the optimal truck size and associated expected cost
