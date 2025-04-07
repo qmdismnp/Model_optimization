@@ -1,0 +1,126 @@
+import gurobipy as gp
+from gurobipy import GRB
+import numpy as np
+
+# Create a new model
+model = gp.Model('DonutPackPricing')
+
+# Parameters
+times = ["6pm", "7pm", "8pm", "9pm", "10pm", "11pm"]
+max_demand_regular = [72, 70, 123, 93, 51, 41]
+slope_regular = [15, 12, 13, 8, 20, 42]
+max_demand_jelly = [66, 76, 116, 86, 56, 46]
+slope_jelly = [14, 13, 11, 8, 24, 28]
+
+# Costs per 2-pack
+cost_regular = 0.66  # $0.33 per donut
+cost_jelly = 0.92    # $0.46 per donut
+
+# Available supply (in terms of 2-packs)
+supply_regular = 222 // 2  # 111 packs
+supply_jelly = 274 // 2    # 137 packs
+
+# Decision variables
+price_regular = {}
+price_jelly = {}
+demand_regular = {}
+demand_jelly = {}
+
+# Create variables for prices and demands at each time
+for t in range(len(times)):
+    # Price variables - non-negative continuous variables
+    price_regular[t] = model.addVar(lb=0.0, name=f"price_regular_{times[t]}")
+    price_jelly[t] = model.addVar(lb=0.0, name=f"price_jelly_{times[t]}")
+    
+    # Demand variables - can be derived from price, but creating explicit variables helps with the model
+    demand_regular[t] = model.addVar(lb=0.0, name=f"demand_regular_{times[t]}")
+    demand_jelly[t] = model.addVar(lb=0.0, name=f"demand_jelly_{times[t]}")
+
+# Update model to incorporate the new variables
+model.update()
+
+# Demand constraints (relation between price and demand)
+for t in range(len(times)):
+    model.addConstr(demand_regular[t] == max_demand_regular[t] - slope_regular[t] * price_regular[t], 
+                     name=f"demand_regular_constraint_{times[t]}")
+    model.addConstr(demand_jelly[t] == max_demand_jelly[t] - slope_jelly[t] * price_jelly[t], 
+                     name=f"demand_jelly_constraint_{times[t]}")
+
+# Supply constraints
+model.addConstr(gp.quicksum(demand_regular[t] for t in range(len(times))) <= supply_regular, name="supply_regular")
+model.addConstr(gp.quicksum(demand_jelly[t] for t in range(len(times))) <= supply_jelly, name="supply_jelly")
+
+# Price pattern constraints (increasing until 8pm, then decreasing)
+# For regular donuts
+for t in range(2):  # 6pm to 8pm (increasing)
+    model.addConstr(price_regular[t] <= price_regular[t+1], name=f"price_regular_increasing_{times[t]}_{times[t+1]}")
+for t in range(2, 5):  # 8pm to 11pm (decreasing)
+    model.addConstr(price_regular[t] >= price_regular[t+1], name=f"price_regular_decreasing_{times[t]}_{times[t+1]}")
+
+# For jelly-filled donuts
+for t in range(2):  # 6pm to 8pm (increasing)
+    model.addConstr(price_jelly[t] <= price_jelly[t+1], name=f"price_jelly_increasing_{times[t]}_{times[t+1]}")
+for t in range(2, 5):  # 8pm to 11pm (decreasing)
+    model.addConstr(price_jelly[t] >= price_jelly[t+1], name=f"price_jelly_decreasing_{times[t]}_{times[t+1]}")
+
+# Objective function: maximize profit
+profit_terms = [(price_regular[t] - cost_regular) * demand_regular[t] + 
+                (price_jelly[t] - cost_jelly) * demand_jelly[t] for t in range(len(times))]
+
+# Set up the objective - note: we can't directly use the product of variables in Gurobi
+# We'll use the quadratic objective capability of Gurobi
+model.setObjective(
+    gp.quicksum(
+        # For regular donuts
+        (price_regular[t] - cost_regular) * max_demand_regular[t] - 
+        (price_regular[t] - cost_regular) * slope_regular[t] * price_regular[t] +
+        
+        # For jelly-filled donuts
+        (price_jelly[t] - cost_jelly) * max_demand_jelly[t] - 
+        (price_jelly[t] - cost_jelly) * slope_jelly[t] * price_jelly[t]
+        
+        for t in range(len(times))
+    ),
+    GRB.MAXIMIZE
+)
+
+# Set NonConvex parameter to 2 to handle non-convex quadratic objective
+model.Params.NonConvex = 2
+
+# Optimize model
+model.optimize()
+
+# Check if optimal solution found
+if model.status == GRB.OPTIMAL:
+    print("Optimal solution found!")
+    
+    # Print optimal prices and demands
+    print("\nOptimal Prices and Demands:")
+    print(f"{'Time':<10}{'Regular Price':>15}{'Regular Demand':>20}{'Jelly Price':>15}{'Jelly Demand':>20}")
+    print("-" * 80)
+    
+    total_regular_demand = 0
+    total_jelly_demand = 0
+    total_profit = 0
+    
+    for t in range(len(times)):
+        reg_price = price_regular[t].X
+        reg_demand = demand_regular[t].X
+        jelly_price = price_jelly[t].X
+        jelly_demand = demand_jelly[t].X
+        
+        # Calculate profit for this time period
+        period_profit = (reg_price - cost_regular) * reg_demand + (jelly_price - cost_jelly) * jelly_demand
+        total_profit += period_profit
+        
+        total_regular_demand += reg_demand
+        total_jelly_demand += jelly_demand
+        
+        print(f"{times[t]:<10}{reg_price:>15.2f}{reg_demand:>20.2f}{jelly_price:>15.2f}{jelly_demand:>20.2f}")
+    
+    print("\nSummary:")
+    print(f"Total regular 2-packs sold: {total_regular_demand:.2f} out of {supply_regular} available")
+    print(f"Total jelly 2-packs sold: {total_jelly_demand:.2f} out of {supply_jelly} available")
+    print(f"Total profit: ${total_profit:.2f}")
+else:
+    print("No optimal solution found.")
